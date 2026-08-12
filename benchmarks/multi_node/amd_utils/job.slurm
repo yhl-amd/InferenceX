@@ -509,6 +509,10 @@ DOCKER_ENV_COMMON=(
     -e MORI_IO_QP_MAX_CQE=\${MORI_IO_QP_MAX_CQE:-}
     -e MORI_IO_QP_MAX_SGE=\${MORI_IO_QP_MAX_SGE:-}
     -e MORI_IO_TC_DISABLE=\${MORI_IO_TC_DISABLE:-}
+    # Cross-checks the KV free-block counter against a walk of the free list on
+    # every mutation, so the operation that desynchronises them names itself.
+    # O(pool) per mutation, so it is off unless a run asks for it.
+    -e VLLM_KV_ACCOUNTING_AUDIT=\${VLLM_KV_ACCOUNTING_AUDIT:-}
     # aiperf client knobs. The SGLang path forwards these into its sibling client
     # container's env-file, but a co-located client (the vllm-disagg agentic path,
     # which runs trace_replay.sh inside this container) only sees what crosses this

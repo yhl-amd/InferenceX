@@ -1440,6 +1440,246 @@ diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
 DIFF_BLOCK_POOL_REFCNT
 apply_one "vllm/v1/core/block_pool.py" "_report_negative_usage" "$WS/BLOCK_POOL_REFCNT.diff"
 
+# --- turn a stale free-block counter into an error instead of a GPU fault ------
+# Run 5 died with "Memory access fault ... Reason: Unknown" on 7 of 8 prefill
+# GPUs, ~3 minutes after KV cache usage first read -0.1%. The two are the same
+# event, and popleft_n is what connects them:
+#
+#   num_free_blocks says 1365, the list actually holds 1363 (pool is 1364 blocks,
+#   null excluded, i.e. the list was completely full and intact -- so the counter,
+#   not the list, is wrong). get_new_blocks gates only on that counter, so it
+#   admits a request for more blocks than exist. popleft_n then walks n nodes
+#   without ever checking for the sentinel, so it returns fake_free_list_tail --
+#   block_id -1 -- which satisfies the ref_cnt == 0 assertion and is handed out
+#   as an ordinary block. Once -1 reaches the block table every rank indexes the
+#   KV cache one block below its own base, which is exactly what the fault
+#   addresses showed: seven different bases, identical low bits (...c00000).
+#
+# Two changes, both additive:
+#   1. popleft_n refuses to cross the sentinel and raises where the accounting is
+#      still local, instead of laundering a counter bug into an out-of-bounds GPU
+#      write minutes later.
+#   2. an env-gated audit compares the counter against a real walk after every
+#      mutation, so the operation that drops a decrement names itself. The
+#      existing probes cannot: _drop_already_linked only sees re-inserts and the
+#      ref_cnt probe only sees over-frees, and in run 5 neither fired.
+ROOT="$ROOT" python3 - <<'PY_KV_ACCOUNTING'
+import os, sys
+
+root = os.environ["ROOT"]
+path = os.path.join(root, "vllm/v1/core/kv_cache_utils.py")
+src = open(path, encoding="utf-8").read()
+
+if "_KV_ACCOUNTING_AUDIT" in src:
+    print("  kv_cache_utils.py: accounting guard already present (skip)")
+    sys.exit(0)
+
+def sub(old, new, what):
+    global src
+    n = src.count(old)
+    if n != 1:
+        print(f"  ERROR: anchor for {what} found {n} times (expected 1)")
+        sys.exit(1)
+    src = src.replace(old, new, 1)
+
+# module-level knobs, placed right after the logger
+sub(
+    "logger = init_logger(__name__)\n",
+    "logger = init_logger(__name__)\n"
+    "\n"
+    "# O(pool) per free-list mutation, so opt-in.\n"
+    '_KV_ACCOUNTING_AUDIT = os.environ.get("VLLM_KV_ACCOUNTING_AUDIT", "0") == "1"\n'
+    "_MAX_KV_AUDIT_REPORTS = 20\n",
+    "module knobs",
+)
+
+# 1. containment: never hand out the sentinel
+sub(
+    """        ret = []
+        for _ in range(n):
+            assert curr_block is not None
+            ret.append(curr_block)""",
+    """        ret = []
+        for _ in range(n):
+            if curr_block is None or curr_block is self.fake_free_list_tail:
+                # The counter promised more blocks than the list holds. Going on
+                # would return the fake tail (block_id -1) as an allocatable
+                # block; it passes get_new_blocks' ref_cnt == 0 assertion, lands
+                # in the block table, and faults the GPU far from here.
+                #
+                # Everything reachable has already been unlinked into ret, so
+                # leave an empty-but-valid list behind: the head still points at
+                # the first block we took, and the caller is about to discard
+                # ret, so without this the queue would be structurally broken on
+                # the way out.
+                claimed = self.num_free_blocks + n
+                self.fake_free_list_head.next_free_block = self.fake_free_list_tail
+                self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+                self.num_free_blocks = 0
+                raise RuntimeError(
+                    "KV free list exhausted after "
+                    f"{len(ret)} of {n} requested blocks, but num_free_blocks "
+                    f"claimed {claimed}; block accounting is corrupt "
+                    "(see VLLM_KV_ACCOUNTING_AUDIT=1)"
+                )
+            ret.append(curr_block)""",
+    "popleft_n sentinel guard",
+)
+
+# 2. the same batch listing a block twice would self-loop the list and count it
+#    twice; _drop_already_linked cannot see it because it samples link state
+#    before any linking happens.
+sub(
+    """        linked = [block for block in blocks if self._is_linked(block)]
+        if not linked:
+            return blocks""",
+    """        seen: set[int] = set()
+        unique: list[KVCacheBlock] = []
+        repeated: list[KVCacheBlock] = []
+        for block in blocks:
+            if id(block) in seen:
+                repeated.append(block)
+                continue
+            seen.add(id(block))
+            unique.append(block)
+        if repeated:
+            logger.error(
+                "Free block queue asked by %s to insert the same block twice in "
+                "one batch (ids=%s); linking it twice would point the block at "
+                "itself and count it twice. Keeping one copy.",
+                caller,
+                [block.block_id for block in repeated],
+                stack_info=True,
+            )
+        blocks = unique
+        linked = [block for block in blocks if self._is_linked(block)]
+        if not linked:
+            return blocks""",
+    "within-batch dedupe",
+)
+
+# 3. the audit itself, plus a call at the end of every mutator
+sub(
+    "    def get_all_free_blocks(self) -> list[KVCacheBlock]:",
+    '''    def _audit(self, op: str) -> None:
+        """Compare num_free_blocks against an actual walk of the list.
+
+        Counter and links are maintained by hand in each mutator, so a missed
+        decrement leaves the counter permanently high while the list stays
+        perfectly valid. Nothing notices until the pool is asked for more blocks
+        than it holds, which is far too late to attribute, so check at the
+        mutation and report the first one that diverges.
+        """
+        if not _KV_ACCOUNTING_AUDIT or self._audit_reports >= _MAX_KV_AUDIT_REPORTS:
+            return
+        walked = 0
+        curr = self.fake_free_list_head.next_free_block
+        while curr is not None and curr.next_free_block is not None:
+            walked += 1
+            curr = curr.next_free_block
+        if walked == self.num_free_blocks:
+            return
+        self._audit_reports += 1
+        logger.error(
+            "KV free-list accounting diverged during %s: num_free_blocks=%d but "
+            "the list holds %d (drift %+d). This is the operation that "
+            "introduced it. (report %d/%d)",
+            op,
+            self.num_free_blocks,
+            walked,
+            self.num_free_blocks - walked,
+            self._audit_reports,
+            _MAX_KV_AUDIT_REPORTS,
+            stack_info=True,
+        )
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:''',
+    "_audit method",
+)
+
+sub(
+    """            self.fake_free_list_head.next_free_block = self.fake_free_list_tail
+            self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+""",
+    """            self.fake_free_list_head.next_free_block = self.fake_free_list_tail
+            self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+
+        self._audit_reports = 0
+""",
+    "audit counter init",
+)
+
+sub(
+    """        self.num_free_blocks -= 1
+        return first_block""",
+    """        self.num_free_blocks -= 1
+        self._audit("popleft")
+        return first_block""",
+    "popleft audit call",
+)
+
+sub(
+    """            self.fake_free_list_head.next_free_block = curr_block
+            curr_block.prev_free_block = self.fake_free_list_head
+        return ret""",
+    """            self.fake_free_list_head.next_free_block = curr_block
+            curr_block.prev_free_block = self.fake_free_list_head
+        self._audit("popleft_n")
+        return ret""",
+    "popleft_n audit call",
+)
+
+sub(
+    """        block.prev_free_block = block.next_free_block = None
+        self.num_free_blocks -= 1
+""",
+    """        block.prev_free_block = block.next_free_block = None
+        self.num_free_blocks -= 1
+        self._audit("remove")
+""",
+    "remove audit call",
+)
+
+sub(
+    """        self.num_free_blocks += 1
+""",
+    """        self.num_free_blocks += 1
+        self._audit("append")
+""",
+    "append audit call",
+)
+
+sub(
+    """        prev_block.next_free_block = first_block
+        first_block.prev_free_block = prev_block
+
+        self.num_free_blocks += len(blocks)""",
+    """        prev_block.next_free_block = first_block
+        first_block.prev_free_block = prev_block
+
+        self.num_free_blocks += len(blocks)
+        self._audit("prepend_n")""",
+    "prepend_n audit call",
+)
+
+sub(
+    """        last_block.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = last_block
+
+        self.num_free_blocks += len(blocks)""",
+    """        last_block.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = last_block
+
+        self.num_free_blocks += len(blocks)
+        self._audit("append_n")""",
+    "append_n audit call",
+)
+
+open(path, "w", encoding="utf-8").write(src)
+print("  kv_cache_utils.py: APPLIED (popleft_n sentinel guard + accounting audit)")
+PY_KV_ACCOUNTING
+if [ $? -ne 0 ]; then echo "ERROR: kv accounting guard failed to apply" >&2; exit 1; fi
+
 
 say "3/4 aiter #4521 (fp8 cp round-robin asm MLA verify kernels)  [needs network + hipcc + GPU]"
 # Unlike the offline Python diffs above, #4521 ships BINARY .co kernels (not in
@@ -1514,6 +1754,8 @@ echo "chk mla.py                     = $(grep -c 'if not self.impl.supports_quan
 echo "chk attn_utils.py              = $(grep -c 'cg_support_exclude_layers' "$ROOT/vllm/v1/worker/gpu/attn_utils.py")"
 echo "chk model_runner.py            = $(grep -c 'cg_support_exclude_layers' "$ROOT/vllm/v1/worker/gpu/model_runner.py")"
 echo "chk kv_cache_utils.py          = $(grep -c '_drop_already_linked' "$ROOT/vllm/v1/core/kv_cache_utils.py")  (expect 4)"
+echo "chk kv_cache_utils.py (audit)  = $(grep -c '_audit(' "$ROOT/vllm/v1/core/kv_cache_utils.py")  (expect 7)"
+echo "chk kv_cache_utils.py (sentinel) = $(grep -c 'KV free list exhausted after' "$ROOT/vllm/v1/core/kv_cache_utils.py")  (expect 1)"
 echo "chk block_pool.py              = $(grep -c 'freed with ref_cnt already 0' "$ROOT/vllm/v1/core/block_pool.py")"
 echo "chk fused_recurrent.py         = $(grep -c 'reshape(-1).contiguous()' "$ROOT/vllm/models/kimi_k3/amd/ops/third_party/kda/fused_recurrent.py")"
 echo "triton          = $(python -c 'import triton; print(triton.__version__)')  (expect 3.7.0*)"
