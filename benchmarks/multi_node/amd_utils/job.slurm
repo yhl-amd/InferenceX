@@ -513,6 +513,13 @@ DOCKER_ENV_COMMON=(
     # every mutation, so the operation that desynchronises them names itself.
     # O(pool) per mutation, so it is off unless a run asks for it.
     -e VLLM_KV_ACCOUNTING_AUDIT=\${VLLM_KV_ACCOUNTING_AUDIT:-}
+    # ROCm debug agent. With HSA_TOOLS_LIB pointing at librocm-debug-agent.so.2 and
+    # HSA_ENABLE_DEBUG=1, a memory access fault prints the faulting wave's PC and
+    # dumps the loaded code objects, which llvm-objdump --mcpu=gfx950 then turns
+    # into the offending kernel. Costly, so all three default to empty.
+    -e HSA_TOOLS_LIB=\${HSA_TOOLS_LIB:-}
+    -e HSA_ENABLE_DEBUG=\${HSA_ENABLE_DEBUG:-}
+    -e ROCM_DEBUG_AGENT_OPTIONS=\${ROCM_DEBUG_AGENT_OPTIONS:-}
     # aiperf client knobs. The SGLang path forwards these into its sibling client
     # container's env-file, but a co-located client (the vllm-disagg agentic path,
     # which runs trace_replay.sh inside this container) only sees what crosses this
