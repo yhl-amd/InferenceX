@@ -745,7 +745,6 @@ kimik3-fp4-mi355x-vllm-disagg-agentic-mtp-read:
           - "PREFILL_NODES=1"
           - "MORIIO_READ_MODE=true"
           - "MORI_WAITALL_BUILD=0"
-          - "PREFILL_EXTRA_SERVE_ARGS=--enforce-eager"
         decode:
           num-worker: 1
           tp: 8
@@ -767,7 +766,6 @@ kimik3-fp4-mi355x-vllm-disagg-agentic-mtp-read:
           - "PREFILL_NODES=1"
           - "MORIIO_READ_MODE=true"
           - "MORI_WAITALL_BUILD=0"
-          - "PREFILL_EXTRA_SERVE_ARGS=--enforce-eager"
         decode:
           num-worker: 1
           tp: 8
