@@ -50,8 +50,8 @@ if [ "$DP_ATTENTION" = "true" ] && [ $((2 * CONC % TP)) -ne 0 ]; then
 fi
 
 # DEP8 (TP8 + DP-attention) is a high-concurrency SimpleCPU arm tuned separately
-# from DEP4 with lower GPU-memory-utilization
-# headroom. Both DEP arms chunk long prefills.
+# from DEP4 with its own profiled KV-cache byte budget. Both DEP arms chunk
+# long prefills.
 IS_DEP8=false
 if [ "$DP_ATTENTION" = "true" ] && [ "$TP" -eq 8 ]; then
     IS_DEP8=true
@@ -229,9 +229,7 @@ else
     TP_ARGS+=(--disable-custom-all-reduce)
 fi
 
-# Keep scheduler behavior stable across vLLM image defaults for every TP/DEP
-# submission point.
-MODE_ARGS=(--max-num-batched-tokens 8192)
+MODE_ARGS=()
 if [ "$EP_SIZE" -gt 1 ]; then
     MODE_ARGS+=(
         --enable-expert-parallel
@@ -249,10 +247,24 @@ fi
 if [ "$DP_ATTENTION" = "true" ]; then
     # The DEP source recipe enforces 2*CONC = DP_WORLD_SIZE*MAX_NUM_SEQS.
     MAX_NUM_SEQS=$((2 * CONC / TP))
+    MAX_NUM_BATCHED_TOKENS=8192
+    if [ "$IS_DEP8" = "true" ]; then
+        # Lowest completed DEP8 recommendation: c576 in run 32134936706.
+        KV_CACHE_MEMORY=97821254595
+    else
+        # Lowest completed DEP4 recommendation: c64 in run 32134936706.
+        KV_CACHE_MEMORY=20442337690
+    fi
 else
-    # Preserve the previous TP4 scheduler headroom for agentic fan-out.
-    MAX_NUM_SEQS=$((2 * CONC))
+    # Pure TP retains 4x global sequence headroom for agentic fan-out while
+    # keeping prefill batches proportional to the submitted concurrency.
+    MAX_NUM_SEQS=$((4 * CONC))
+    MAX_NUM_BATCHED_TOKENS=$((16 * CONC))
+    # TP8 did not finish loading in the new-image run. Use the smaller exact
+    # TP4 c16 fit-requested recommendation for both TP4 and TP8.
+    KV_CACHE_MEMORY=39232257434
 fi
+MODE_ARGS+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
 # MTP: cudagraph capture sizes are in TOKENS. With num_speculative_tokens=N,
 # every uniform decode batch of S seqs verifies S*(1+N) tokens, so capture the
 # explicit multiples (1+N), 2*(1+N), ..., MAX_NUM_SEQS*(1+N) -- one graph per
@@ -285,19 +297,12 @@ export TORCH_CUDA_ARCH_LIST="10.0"
 export PYTHONNOUSERSITE=1
 export VLLM_FLOAT32_MATMUL_PRECISION=high
 
-# DEP8 keeps its profiled 0.92 memory headroom; all other topologies
-# (TP4/DEP4/TP8) use 0.95.
-GPU_MEM_UTIL=0.95
-if [ "$IS_DEP8" = "true" ]; then
-    GPU_MEM_UTIL=0.92
-fi
-
 { set +x; } 2>/dev/null
 VLLM_CMD=(
     vllm serve "$MODEL_PATH" --served-model-name "$MODEL"
     --host 0.0.0.0
     --port "$VLLM_BACKEND_PORT"
-    --gpu-memory-utilization "$GPU_MEM_UTIL"
+    --kv-cache-memory "$KV_CACHE_MEMORY"
     --trust-remote-code
     --no-enable-flashinfer-autotune
     --no-disable-hybrid-kv-cache-manager
