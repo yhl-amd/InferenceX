@@ -90,6 +90,11 @@ kimik3-read-rescan-c12-c16-dram080:
           - "PREFILL_NODES=1"
           - "MORIIO_READ_MODE=true"
           - "MORI_WAITALL_BUILD=0"
+          - "PREFILL_DISABLE_SPECULATIVE_CONFIG=true"
+          - "MORIIO_DECODE_LOCAL_PREFILL_FOR_SPEC=true"
+          - "EVAL_FRAMEWORK=lm-eval"
+          - "EVAL_CONCURRENT_REQUESTS=1"
+          - "EVAL_LIMIT=4"
         decode:
           num-worker: 1
           tp: 8
@@ -98,24 +103,6 @@ kimik3-read-rescan-c12-c16-dram080:
           additional-settings:
           - "DECODE_NODES=1"
           - "DECODE_MTP_SIZE=2"
-      - spec-decoding: mtp
-        kv-offloading: dram
-        kv-offload-backend: { name: vllm-simple }
-        conc-list: [16]
-        prefill:
-          num-worker: 1
-          tp: 8
-          ep: 1
-          dp-attn: false
-          additional-settings:
-          - "PREFILL_NODES=1"
-          - "MORIIO_READ_MODE=true"
-          - "MORI_WAITALL_BUILD=0"
-        decode:
-          num-worker: 1
-          tp: 8
-          ep: 1
-          dp-attn: false
-          additional-settings:
-          - "DECODE_NODES=1"
-          - "DECODE_MTP_SIZE=2"
+          - "EVAL_FRAMEWORK=lm-eval"
+          - "EVAL_CONCURRENT_REQUESTS=1"
+          - "EVAL_LIMIT=4"

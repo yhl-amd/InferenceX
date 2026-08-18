@@ -312,7 +312,7 @@ index c53c0eb99..33da7abc7 100644
  
          if self.is_producer:
              set_role(ROLE.PRODUCER)
-@@ -497,21 +590,65 @@ class MoRIIOConnectorScheduler:
+@@ -497,21 +590,85 @@ class MoRIIOConnectorScheduler:
                asynchronously (between scheduler steps).
          """
          if self.is_producer:
@@ -335,6 +335,26 @@ index c53c0eb99..33da7abc7 100644
 +                # the pushed KDA state, so only N-1 tokens come from remote.
 +                num_tokens -= 1
 +            return num_tokens - num_computed_tokens, True
++
++        params = request.kv_transfer_params
++        if (
++            self.vllm_config.speculative_config is not None
++            and params is not None
++            and params.get("do_remote_prefill")
++            and os.environ.get("MORIIO_DECODE_LOCAL_PREFILL_FOR_SPEC", "false").lower()
++            in ("1", "true", "yes", "on")
++        ):
++            # Bringup-safe correctness mode for asymmetric no-prefill-draft
++            # experiments. If the prefiller does not load the draft model, the
++            # decoder cannot use remote target-KV progress as the draft model's
++            # progress: the draft KV/state would remain unconditioned on the
++            # prompt and block verification rejects every token. Until the
++            # drafter has a separate prompt catch-up path, force the decoder to
++            # compute the prompt locally so both target and draft states are
++            # initialized consistently. update_state_after_alloc still carries
++            # the mamba slot/notify path when num_external_tokens == 0, so the
++            # prefiller is released instead of leaking remote blocks.
++            return 0, False
 +
 +        # READ mode always recomputes the last token locally on the decoder.
 +        #

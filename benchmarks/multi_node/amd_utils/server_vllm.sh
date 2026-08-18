@@ -170,6 +170,61 @@ if [[ -n "${DECODE_TP_SIZE:-}" ]]; then
         DECODE_SERVER_CONFIG+=" --tensor-parallel-size ${DECODE_TP_SIZE}"
     fi
 fi
+
+_edit_speculative_config() {
+    SPEC_SERVER_CONFIG="$1" SPEC_EDIT_MODE="$2" python3 - <<'PY'
+import json
+import os
+import shlex
+import sys
+
+cfg = os.environ["SPEC_SERVER_CONFIG"]
+mode = os.environ["SPEC_EDIT_MODE"]
+try:
+    tokens = shlex.split(cfg)
+except ValueError as exc:
+    print(f"ERROR: failed to parse server config while editing --speculative-config: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    index = tokens.index("--speculative-config")
+except ValueError:
+    print(cfg)
+    sys.exit(0)
+
+if mode == "drop":
+    del tokens[index:index + 2]
+    print(shlex.join(tokens))
+    sys.exit(0)
+
+if index + 1 >= len(tokens):
+    print("ERROR: --speculative-config is missing its JSON value", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    spec = json.loads(tokens[index + 1])
+except json.JSONDecodeError as exc:
+    print(f"ERROR: invalid --speculative-config JSON before eval rewrite: {exc}", file=sys.stderr)
+    print(tokens[index + 1], file=sys.stderr)
+    sys.exit(1)
+
+if mode == "real_verify":
+    spec["rejection_sample_method"] = "block"
+    spec.pop("synthetic_acceptance_length", None)
+else:
+    print(f"ERROR: unknown SPEC_EDIT_MODE={mode}", file=sys.stderr)
+    sys.exit(1)
+
+tokens[index + 1] = json.dumps(spec, separators=(",", ":"))
+print(shlex.join(tokens))
+PY
+}
+
+if [[ "${PREFILL_DISABLE_SPECULATIVE_CONFIG:-false}" == "true" ]]; then
+    PREFILL_SERVER_CONFIG=$(_edit_speculative_config "$PREFILL_SERVER_CONFIG" drop)
+    echo "[prefill] speculative decoding disabled for prefill server"
+fi
+
 # Throughput arms pin a synthetic acceptance length, which commits drafted
 # tokens without consulting the target's logits: fast, but the generated text is
 # wrong. An accuracy run has to verify for real. Without this, GSM8K scored
@@ -179,14 +234,13 @@ fi
 # vLLM rejects synthetic_acceptance_length unless the method is 'synthetic',
 # so drop that key in the same rewrite.
 if [[ "${EVAL_ONLY:-false}" == "true" || "${RUN_EVAL:-false}" == "true" ]]; then
-    _real_verify() {
-        printf '%s' "$1" |
-            sed -E 's/\\?"rejection_sample_method\\?"[[:space:]]*:[[:space:]]*\\?"synthetic\\?"/\\"rejection_sample_method\\": \\"block\\"/g' |
-            sed -E 's/,[[:space:]]*\\?"synthetic_acceptance_length\\?"[[:space:]]*:[[:space:]]*[0-9.]+//g'
-    }
     if echo "$PREFILL_SERVER_CONFIG" | grep -q 'rejection_sample_method'; then
-        PREFILL_SERVER_CONFIG=$(_real_verify "$PREFILL_SERVER_CONFIG")
-        DECODE_SERVER_CONFIG=$(_real_verify "$DECODE_SERVER_CONFIG")
+        PREFILL_SERVER_CONFIG=$(_edit_speculative_config "$PREFILL_SERVER_CONFIG" real_verify)
+    fi
+    if echo "$DECODE_SERVER_CONFIG" | grep -q 'rejection_sample_method'; then
+        DECODE_SERVER_CONFIG=$(_edit_speculative_config "$DECODE_SERVER_CONFIG" real_verify)
+    fi
+    if echo "$PREFILL_SERVER_CONFIG $DECODE_SERVER_CONFIG" | grep -q 'rejection_sample_method'; then
         echo "[eval] speculative decoding switched to real block verification"
     fi
 fi
@@ -475,7 +529,9 @@ if [ "$NODE_RANK" -eq 0 ]; then
 
             source /workspace/benchmarks/benchmark_lib.sh
 
-            if [[ -n "${EVAL_CONC:-}" ]]; then
+            if [[ -n "${EVAL_CONCURRENT_REQUESTS:-}" ]]; then
+                echo "Using explicit EVAL_CONCURRENT_REQUESTS=${EVAL_CONCURRENT_REQUESTS}"
+            elif [[ -n "${EVAL_CONC:-}" ]]; then
                 export EVAL_CONCURRENT_REQUESTS="${EVAL_CONC}"
             else
                 export EVAL_CONCURRENT_REQUESTS=$(echo "$BENCH_MAX_CONCURRENCY" | tr 'x' '\n' | sort -n | tail -1)
