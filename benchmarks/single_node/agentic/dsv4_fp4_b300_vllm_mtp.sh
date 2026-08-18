@@ -50,7 +50,7 @@ if [ "$DP_ATTENTION" = "true" ] && [ $((2 * CONC % TP)) -ne 0 ]; then
 fi
 
 # DEP8 (TP8 + DP-attention) is a high-concurrency SimpleCPU arm tuned separately
-# from DEP4 with a larger prefill token budget and lower GPU-memory-utilization
+# from DEP4 with lower GPU-memory-utilization
 # headroom. Both DEP arms chunk long prefills.
 IS_DEP8=false
 if [ "$DP_ATTENTION" = "true" ] && [ "$TP" -eq 8 ]; then
@@ -229,7 +229,9 @@ else
     TP_ARGS+=(--disable-custom-all-reduce)
 fi
 
-MODE_ARGS=()
+# Keep scheduler behavior stable across vLLM image defaults for every TP/DEP
+# submission point.
+MODE_ARGS=(--max-num-batched-tokens 8192)
 if [ "$EP_SIZE" -gt 1 ]; then
     MODE_ARGS+=(
         --enable-expert-parallel
@@ -242,13 +244,6 @@ if [ "$DP_ATTENTION" = "true" ]; then
         --prefill-schedule-interval 8
         --long-prefill-token-threshold 512
     )
-    if [ "$IS_DEP8" = "true" ]; then
-        # DEP8 gets a larger prefill token budget; the shared long-prefill
-        # threshold keeps decode latency bounded under load.
-        MODE_ARGS+=(--max-num-batched-tokens 16384)
-    else
-        MODE_ARGS+=(--max-num-batched-tokens 8192)
-    fi
 fi
 
 if [ "$DP_ATTENTION" = "true" ]; then
@@ -290,8 +285,8 @@ export TORCH_CUDA_ARCH_LIST="10.0"
 export PYTHONNOUSERSITE=1
 export VLLM_FLOAT32_MATMUL_PRECISION=high
 
-# DEP8 leaves more headroom for its larger prefill token budget; all other
-# topologies (TP4/DEP4/TP8) use 0.95.
+# DEP8 keeps its profiled 0.92 memory headroom; all other topologies
+# (TP4/DEP4/TP8) use 0.95.
 GPU_MEM_UTIL=0.95
 if [ "$IS_DEP8" = "true" ]; then
     GPU_MEM_UTIL=0.92

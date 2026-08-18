@@ -6111,3 +6111,11 @@
   description:
     - "Update the B300 DeepSeek-V4-Pro vLLM AgentX MTP image from 426e59f to d62ad46."
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/2647
+
+- config-keys:
+    - dsv4-fp4-b300-vllm-agentic-mtp
+  scenario-type:
+    - agentic-coding
+  description:
+    - "Pin max-num-batched-tokens to 8192 for every B300 TP4, TP8, DEP4, and DEP8 AgentX submission point after the vLLM image refresh."
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/2647
