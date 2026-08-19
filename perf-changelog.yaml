@@ -6187,6 +6187,10 @@
 - config-keys:
     - qwen3.5-fp4-mi355x-sglang
     - qwen3.5-fp4-mi355x-sglang-mtp
+  scenario-type:
+    - fixed-seq-len
   description:
     - "Bump image from lmsysorg/sglang-rocm:v0.5.16-rocm720-mi35x-20260730 to lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260818"
+    - "Serve both arms with an fp8_e4m3 KV cache."
+    - "Tune the MTP arm: context length capped at ISL+OSL+20, decode CUDA graph max batch pinned to the concurrency, 32768-token chunked prefill and prefill budget, scheduler receive and stream intervals of 1, and 6 tokenizer workers."
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/2640

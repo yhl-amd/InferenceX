@@ -47,6 +47,15 @@ python3 -m sglang.launch_server --model-path=$MODEL --trust-remote-code \
 --speculative-num-steps 3 \
 --speculative-eagle-topk 1 \
 --speculative-num-draft-tokens 4 \
+--context-length $((ISL + OSL + 20)) \
+--kv-cache-dtype fp8_e4m3 \
+--mamba-ssm-dtype bfloat16 \
+--cuda-graph-max-bs-decode $CONC \
+--max-prefill-tokens 32768 \
+--chunked-prefill-size 32768 \
+--scheduler-recv-interval 1 \
+--tokenizer-worker-num 6 \
+--stream-interval 1 \
 > $SERVER_LOG 2>&1 &
 
 SERVER_PID=$!
